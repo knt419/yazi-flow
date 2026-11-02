@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""yazi-flow — start Yazi with the highlighted CWD on the row your eyes are already on.
+
+Yazi 26 draws the parent pane's highlight on the first rows whenever you launch from
+deep inside a tree (the parent folder jumps 1:1 with the cursor, see
+yazi-core/src/tab/folder.rs `next()`), while the shell prompt you just typed at sits
+near the bottom of the screen.  This launcher measures the prompt's row with a DSR
+query (CSI 6n), converts it into a parent-pane row, and hands it to the flow patch in
+Yazi through YAZI_FLOW_ANCHOR.
+
+Usage:
+    yazi-flow [YAZI ARGS...]
+
+Environment:
+    YAZI_FLOW_YAZI   path to the patched binary (default: yazi-flow-yazi next to this
+                     script, then yazi-flow-yazi / yazi on PATH)
+    YAZI_FLOW_ROW    (output) the prompt row that was measured, 1-based
+    YAZI_FLOW_ANCHOR (output) the parent-pane row handed to Yazi, 0-based
+
+Options:
+    --anchor N   force the parent-pane row (0-based) instead of measuring
+    --no-flow    run plain Yazi without any anchoring
+    --print      measure and print the decision, do not start Yazi
+"""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import os
+import select
+import struct
+import sys
+import termios
+import time
+
+HEADER_ROWS = 1  # ui/root.lua: header 1, tabs, fill, status 1
+STATUS_ROWS = 1
+
+
+def tty_path() -> str | None:
+    try:
+        if os.isatty(sys.stdin.fileno()):
+            return os.ttyname(sys.stdin.fileno())
+    except OSError:
+        pass
+    return "/dev/tty" if os.path.exists("/dev/tty") else None
+
+
+def tty_rows(fd: int) -> int:
+    try:
+        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+        rows = struct.unpack("HHHH", packed)[0]
+        if rows:
+            return rows
+    except OSError:
+        pass
+    return int(os.environ.get("LINES") or 24)
+
+
+def cursor_row(fd: int, timeout: float = 0.25) -> int | None:
+    """Ask the terminal where the cursor is (DSR / CSI 6n); reply is CSI row;col R."""
+    try:
+        saved = termios.tcgetattr(fd)
+    except termios.error:
+        return None
+
+    try:
+        raw = termios.tcgetattr(fd)
+        raw[0] &= ~(termios.IXON | termios.ICRNL)  # keep the reply intact
+        raw[3] &= ~(termios.ICANON | termios.ECHO)
+        raw[6][termios.VMIN] = 0
+        raw[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, raw)
+
+        termios.tcflush(fd, termios.TCIFLUSH)
+        os.write(fd, b"\x1b[6n")
+
+        buf = b""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
+            if not ready:
+                break
+            try:
+                chunk = os.read(fd, 64)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            buf += chunk
+            if b"R" in buf:
+                break
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, saved)
+        except termios.error:
+            pass
+
+    end = buf.find(b"R")
+    if end < 0:
+        return None
+    start = buf.rfind(b"[", 0, end)
+    if start < 0:
+        return None
+    try:
+        row = int(buf[start + 1 : end].split(b";")[0])
+    except ValueError:
+        return None
+    return row if row > 0 else None
+
+
+def anchor_for(row: int, rows: int) -> int:
+    """Prompt row (1-based) -> zero-based row inside the parent pane."""
+    limit = max(1, rows - HEADER_ROWS - STATUS_ROWS)
+    pane_top = HEADER_ROWS  # zero-based screen row of the pane's first line
+    return max(0, min((row - 1) - pane_top, limit - 1))
+
+
+def yazi_binary() -> str:
+    explicit = os.environ.get("YAZI_FLOW_YAZI")
+    if explicit:
+        return explicit
+    here = os.path.dirname(os.path.realpath(__file__))
+    for candidate in (
+        os.path.join(here, "yazi-flow-yazi"),
+        os.path.join(os.path.expanduser("~/.local/bin"), "yazi-flow-yazi"),
+    ):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return "yazi"
+
+
+def main(argv: list[str]) -> int:
+    args = list(argv[1:])
+    force = None
+    no_flow = False
+    dry = False
+    passthrough: list[str] = []
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--anchor" and i + 1 < len(args):
+            force = int(args[i + 1])
+            i += 2
+            continue
+        if a.startswith("--anchor="):
+            force = int(a.split("=", 1)[1])
+            i += 1
+            continue
+        if a == "--no-flow":
+            no_flow = True
+            i += 1
+            continue
+        if a == "--print":
+            dry = True
+            i += 1
+            continue
+        if a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        passthrough.append(a)
+        i += 1
+
+    path = tty_path()
+    fd = None
+    if path is not None:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+        except OSError:
+            fd = None  # no controlling terminal (piped stdin, cron, ...)
+    if fd is None:
+        if dry:
+            print(f"rows={int(os.environ.get('LINES') or 24)} prompt_row=None anchor=None "
+                  f"binary={yazi_binary()}")
+            return 0
+        # Nothing to measure: start Yazi as-is.
+        os.execvp(yazi_binary(), [yazi_binary(), *passthrough])
+
+    try:
+        rows = tty_rows(fd)
+        row = None if force is not None else cursor_row(fd)
+    finally:
+        os.close(fd)
+
+    if no_flow:
+        anchor = None
+    elif force is not None:
+        anchor = force
+    elif row is not None:
+        anchor = anchor_for(row, rows)
+    else:
+        anchor = None  # no answer from the terminal: stock behaviour
+
+    binary = yazi_binary()
+
+    if dry:
+        print(f"rows={rows} prompt_row={row} anchor={anchor} binary={binary}")
+        return 0
+
+    env = dict(os.environ)
+    if anchor is not None:
+        env["YAZI_FLOW_ANCHOR"] = str(anchor)
+    if row is not None:
+        env["YAZI_FLOW_ROW"] = str(row)
+    env["YAZI_FLOW_ROWS"] = str(rows)
+
+    if anchor is not None and os.path.basename(binary) == "yazi":
+        sys.stderr.write(
+            "yazi-flow: warning: running stock yazi (no flow patch), YAZI_FLOW_ANCHOR ignored\n"
+        )
+
+    try:
+        os.execvpe(binary, [binary, *passthrough], env)
+    except FileNotFoundError:
+        sys.stderr.write(f"yazi-flow: {binary}: not found\n")
+        return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
