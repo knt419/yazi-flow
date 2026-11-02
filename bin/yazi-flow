@@ -8,112 +8,199 @@ near the bottom of the screen.  This launcher measures the prompt's row with a D
 query (CSI 6n), converts it into a parent-pane row, and hands it to the flow patch in
 Yazi through YAZI_FLOW_ANCHOR.
 
+Linux/macOS reads the reply from /dev/tty in raw mode; Windows asks the console
+(VT input mode + msvcrt) and falls back to assuming the prompt is on the last row when
+the terminal does not answer.
+
 Usage:
     yazi-flow [YAZI ARGS...]
 
 Environment:
-    YAZI_FLOW_YAZI   path to the patched binary (default: yazi-flow-yazi next to this
-                     script, then yazi-flow-yazi / yazi on PATH)
-    YAZI_FLOW_ROW    (output) the prompt row that was measured, 1-based
-    YAZI_FLOW_ANCHOR (output) the parent-pane row handed to Yazi, 0-based
+    YAZI_FLOW_YAZI     path to the patched binary (default: yazi-flow-yazi next to this
+                       script, then %LOCALAPPDATA%\\yazi-flow or ~/.local/bin, then PATH)
+    YAZI_FLOW_ROW      (output) the prompt row that was measured, 1-based
+    YAZI_FLOW_ANCHOR   (output) the parent-pane row handed to Yazi, 0-based
 
 Options:
-    --anchor N   force the parent-pane row (0-based) instead of measuring
-    --no-flow    run plain Yazi without any anchoring
-    --print      measure and print the decision, do not start Yazi
+    --anchor N     force the parent-pane row (0-based) instead of measuring
+    --no-flow      run plain Yazi without any anchoring
+    --no-fallback  do not guess the row when the terminal does not answer
+    --print        measure and print the decision, do not start Yazi
 """
 
 from __future__ import annotations
 
-import errno
-import fcntl
 import os
-import select
-import struct
 import sys
-import termios
 import time
 
-HEADER_ROWS = 1  # ui/root.lua: header 1, tabs, fill, status 1
+HEADER_ROWS = 1  # yazi-plugin/preset/components/root.lua: header 1, tabs, fill, status 1
 STATUS_ROWS = 1
 
 
-def tty_path() -> str | None:
-    try:
-        if os.isatty(sys.stdin.fileno()):
-            return os.ttyname(sys.stdin.fileno())
-    except OSError:
-        pass
-    return "/dev/tty" if os.path.exists("/dev/tty") else None
+# --- measuring ---------------------------------------------------------------
 
 
-def tty_rows(fd: int) -> int:
-    try:
-        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
-        rows = struct.unpack("HHHH", packed)[0]
-        if rows:
-            return rows
-    except OSError:
-        pass
-    return int(os.environ.get("LINES") or 24)
-
-
-def cursor_row(fd: int, timeout: float = 0.25) -> int | None:
-    """Ask the terminal where the cursor is (DSR / CSI 6n); reply is CSI row;col R."""
-    try:
-        saved = termios.tcgetattr(fd)
-    except termios.error:
-        return None
-
-    try:
-        raw = termios.tcgetattr(fd)
-        raw[0] &= ~(termios.IXON | termios.ICRNL)  # keep the reply intact
-        raw[3] &= ~(termios.ICANON | termios.ECHO)
-        raw[6][termios.VMIN] = 0
-        raw[6][termios.VTIME] = 0
-        termios.tcsetattr(fd, termios.TCSANOW, raw)
-
-        termios.tcflush(fd, termios.TCIFLUSH)
-        os.write(fd, b"\x1b[6n")
-
-        buf = b""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
-            if not ready:
-                break
-            try:
-                chunk = os.read(fd, 64)
-            except OSError as exc:
-                if exc.errno == errno.EIO:
-                    break
-                raise
-            if not chunk:
-                break
-            buf += chunk
-            if b"R" in buf:
-                break
-    finally:
-        try:
-            termios.tcsetattr(fd, termios.TCSANOW, saved)
-        except termios.error:
-            pass
-
-    end = buf.find(b"R")
+def parse_dsr(text: str) -> int | None:
+    """Row out of a DSR reply, i.e. ESC [ <row> ; <col> R."""
+    end = text.find("R")
     if end < 0:
         return None
-    start = buf.rfind(b"[", 0, end)
+    start = text.rfind("[", 0, end)
     if start < 0:
         return None
     try:
-        row = int(buf[start + 1 : end].split(b";")[0])
+        row = int(text[start + 1 : end].split(";")[0])
     except ValueError:
         return None
     return row if row > 0 else None
 
 
+def measure_posix(timeout: float = 0.25) -> tuple[bool, int, int | None]:
+    """(attached to a terminal, rows, cursor row) using /dev/tty and a raw termios read."""
+    import errno
+    import fcntl
+    import select
+    import struct
+    import termios
+
+    path = None
+    try:
+        if os.isatty(sys.stdin.fileno()):
+            path = os.ttyname(sys.stdin.fileno())
+    except OSError:
+        path = None
+    if path is None and os.path.exists("/dev/tty"):
+        path = "/dev/tty"
+    if path is None:
+        return False, int(os.environ.get("LINES") or 24), None
+
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return False, int(os.environ.get("LINES") or 24), None
+
+    try:
+        rows = int(os.environ.get("LINES") or 24)
+        try:
+            packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+            if struct.unpack("HHHH", packed)[0]:
+                rows = struct.unpack("HHHH", packed)[0]
+        except OSError:
+            pass
+
+        try:
+            saved = termios.tcgetattr(fd)
+        except termios.error:
+            return True, rows, None
+
+        reply = ""
+        try:
+            raw = termios.tcgetattr(fd)
+            raw[0] &= ~(termios.IXON | termios.ICRNL)  # keep the reply intact
+            raw[3] &= ~(termios.ICANON | termios.ECHO)
+            raw[6][termios.VMIN] = 0
+            raw[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, raw)
+
+            termios.tcflush(fd, termios.TCIFLUSH)
+            os.write(fd, b"\x1b[6n")
+
+            buf = b""
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
+                if not ready:
+                    break
+                try:
+                    chunk = os.read(fd, 64)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        break
+                    raise
+                if not chunk:
+                    break
+                buf += chunk
+                if b"R" in buf:
+                    break
+            reply = buf.decode("ascii", "replace")
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSANOW, saved)
+            except termios.error:
+                pass
+    finally:
+        os.close(fd)
+
+    return True, rows, parse_dsr(reply)
+
+
+def measure_windows(timeout: float = 0.4) -> tuple[bool, int, int | None]:
+    """(attached to a console, rows, cursor row) through the Win32 console API.
+
+    Windows Terminal answers CSI 6n like any VT terminal; the reply arrives as console
+    input characters once ENABLE_VIRTUAL_TERMINAL_INPUT is on, so it is read with
+    msvcrt instead of a POSIX read loop.
+    """
+    import ctypes
+    import msvcrt
+    import shutil
+
+    rows = os.environ.get("LINES")
+    rows = int(rows) if rows and rows.isdigit() else (shutil.get_terminal_size().lines or 24)
+
+    try:
+        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = k32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False, rows, None
+        original = mode.value
+        if not k32.SetConsoleMode(handle, original | 0x0200):  # VT input
+            return False, rows, None
+    except Exception:
+        return False, rows, None
+
+    reply = ""
+    try:
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+        sys.stdout.write("\x1b[6n")
+        sys.stdout.flush()
+
+        buf = ""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not msvcrt.kbhit():
+                time.sleep(0.005)
+                continue
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):  # function key: swallow its second half
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+                continue
+            buf += ch
+            if ch == "R":
+                break
+        reply = buf
+    finally:
+        try:
+            k32.SetConsoleMode(handle, original)
+        except Exception:
+            pass
+
+    return True, rows, parse_dsr(reply)
+
+
+def measure() -> tuple[bool, int, int | None]:
+    return measure_windows() if os.name == "nt" else measure_posix()
+
+
+# --- launching ---------------------------------------------------------------
+
+
 def anchor_for(row: int, rows: int) -> int:
-    """Prompt row (1-based) -> zero-based row inside the parent pane."""
+    """Prompt row (1-based) -> zero-based row inside the panes."""
     limit = max(1, rows - HEADER_ROWS - STATUS_ROWS)
     pane_top = HEADER_ROWS  # zero-based screen row of the pane's first line
     return max(0, min((row - 1) - pane_top, limit - 1))
@@ -123,20 +210,51 @@ def yazi_binary() -> str:
     explicit = os.environ.get("YAZI_FLOW_YAZI")
     if explicit:
         return explicit
+
     here = os.path.dirname(os.path.realpath(__file__))
-    for candidate in (
-        os.path.join(here, "yazi-flow-yazi"),
-        os.path.join(os.path.expanduser("~/.local/bin"), "yazi-flow-yazi"),
-    ):
-        if os.access(candidate, os.X_OK):
-            return candidate
+    names = ("yazi-flow-yazi.exe", "yazi-flow-yazi") if os.name == "nt" else ("yazi-flow-yazi",)
+
+    dirs = [here]
+    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+        dirs.append(os.path.join(os.environ["LOCALAPPDATA"], "yazi-flow"))
+    dirs.append(os.path.expanduser("~/.local/bin"))
+
+    for directory in dirs:
+        for name in names:
+            candidate = os.path.join(directory, name)
+            if os.path.isfile(candidate):
+                return candidate
     return "yazi"
+
+
+def run(binary: str, args: list[str], env: dict[str, str]) -> int:
+    """Hand the terminal over to Yazi. exec on POSIX; a plain child on Windows, where
+    exec* has no real replacement semantics."""
+    if os.name == "nt":
+        import subprocess
+
+        try:
+            return subprocess.call([binary, *args], env=env)
+        except FileNotFoundError:
+            sys.stderr.write(f"yazi-flow: {binary}: not found\n")
+            return 127
+        except OSError as exc:
+            sys.stderr.write(f"yazi-flow: {binary}: {exc}\n")
+            return 126
+
+    try:
+        os.execvpe(binary, [binary, *args], env)
+    except FileNotFoundError:
+        sys.stderr.write(f"yazi-flow: {binary}: not found\n")
+        return 127
+    return 0  # not reached
 
 
 def main(argv: list[str]) -> int:
     args = list(argv[1:])
     force = None
     no_flow = False
+    no_fallback = False
     dry = False
     passthrough: list[str] = []
 
@@ -155,6 +273,10 @@ def main(argv: list[str]) -> int:
             no_flow = True
             i += 1
             continue
+        if a == "--no-fallback":
+            no_fallback = True
+            i += 1
+            continue
         if a == "--print":
             dry = True
             i += 1
@@ -165,26 +287,9 @@ def main(argv: list[str]) -> int:
         passthrough.append(a)
         i += 1
 
-    path = tty_path()
-    fd = None
-    if path is not None:
-        try:
-            fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
-        except OSError:
-            fd = None  # no controlling terminal (piped stdin, cron, ...)
-    if fd is None:
-        if dry:
-            print(f"rows={int(os.environ.get('LINES') or 24)} prompt_row=None anchor=None "
-                  f"binary={yazi_binary()}")
-            return 0
-        # Nothing to measure: start Yazi as-is.
-        os.execvp(yazi_binary(), [yazi_binary(), *passthrough])
-
-    try:
-        rows = tty_rows(fd)
-        row = None if force is not None else cursor_row(fd)
-    finally:
-        os.close(fd)
+    attached, rows, row = measure()
+    if force is not None:
+        row = None
 
     if no_flow:
         anchor = None
@@ -192,13 +297,18 @@ def main(argv: list[str]) -> int:
         anchor = force
     elif row is not None:
         anchor = anchor_for(row, rows)
+    elif attached and not no_fallback:
+        # No answer from the terminal: assume the prompt sits on the last row, which is
+        # where it is for a shell that just printed something.
+        anchor = anchor_for(rows, rows)
     else:
-        anchor = None  # no answer from the terminal: stock behaviour
+        anchor = None  # nothing to go on: stock behaviour
 
     binary = yazi_binary()
 
     if dry:
-        print(f"rows={rows} prompt_row={row} anchor={anchor} binary={binary}")
+        print(f"rows={rows} prompt_row={row} anchor={anchor} attached={attached} "
+              f"binary={binary}")
         return 0
 
     env = dict(os.environ)
@@ -208,16 +318,12 @@ def main(argv: list[str]) -> int:
         env["YAZI_FLOW_ROW"] = str(row)
     env["YAZI_FLOW_ROWS"] = str(rows)
 
-    if anchor is not None and os.path.basename(binary) == "yazi":
+    if anchor is not None and os.path.basename(binary).removesuffix(".exe") == "yazi":
         sys.stderr.write(
             "yazi-flow: warning: running stock yazi (no flow patch), YAZI_FLOW_ANCHOR ignored\n"
         )
 
-    try:
-        os.execvpe(binary, [binary, *passthrough], env)
-    except FileNotFoundError:
-        sys.stderr.write(f"yazi-flow: {binary}: not found\n")
-        return 127
+    return run(binary, passthrough, env)
 
 
 if __name__ == "__main__":

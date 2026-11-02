@@ -1,11 +1,16 @@
 PY ?= .venv/bin/python
 
-.PHONY: install test venv clean
+.PHONY: install test test-unit test-probe venv clean
 
 install:            ## build the patched yazi and link the launcher
 	scripts/build.sh
 
-test: venv          ## run the PTY probe against the installed binary
+test: test-unit test-probe
+
+test-unit:          ## pure helpers: DSR parsing, anchor maths, binary lookup
+	$(PY) tests/unit.py
+
+test-probe: venv    ## PTY probe against the installed binary (POSIX only)
 	$(PY) tests/probe.py
 
 venv:

@@ -51,7 +51,8 @@ yazi-flow/
 │   ├── current.lua
 │   └── parent.lua
 ├── scripts/build.sh      clone → modules/ 上書き → cargo build → ~/.local/bin
-├── tests/probe.py        PTY + pyte で配置を検証
+├── tests/probe.py        PTY + pyte で配置を検証（POSIX のみ）
+├── tests/unit.py         純関数の単体チェック（どこでも動く）
 ├── tests/requirements.txt
 └── Makefile              install / test / clean
 ```
@@ -103,6 +104,33 @@ def --env y [...args] {
 ```
 
 `y` は `[...args]` の rest 引数なので、フラグを渡すときは `y -- --print` のように `--` を挟む。
+
+## Windows
+
+パッチは Lua のプリセット差し替えなので、Windows でも同じ手順でビルドできます。
+ランチャーも Windows 対応済み（`msvcrt` + `ENABLE_VIRTUAL_TERMINAL_INPUT` で DSR を読み、
+行数は `shutil.get_terminal_size()`）。
+
+```powershell
+git clone --branch v26.9.1 --depth 1 https://github.com/sxyazi/yazi
+Copy-Item modules\current.lua, modules\parent.lua yazi\yazi-plugin\preset\components\
+cd yazi
+cargo build --release --locked --bin yazi
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\yazi-flow" | Out-Null
+Copy-Item target\release\yazi.exe "$env:LOCALAPPDATA\yazi-flow\yazi-flow-yazi.exe"
+# ランチャーは PATH の通った場所へ（例: %LOCALAPPDATA%\yazi-flow\yazi-flow.py として配置し、
+# python で起動する .cmd を挟む）
+```
+
+- 必要: rustup（`stable-x86_64-pc-windows-msvc`）と MSVC Build Tools
+- ランチャーは `%LOCALAPPDATA%\yazi-flow\yazi-flow-yazi.exe` を自動で探します
+  （`YAZI_FLOW_YAZI` で明示も可）
+- 端末が DSR に応答しない場合は「プロンプトは最下行」と仮定してアンカーを決めます。
+  無効化は `--no-fallback`、手動指定は `--anchor N`
+- `yazi-flow --print` で `rows / prompt_row / anchor / attached` を確認できます
+- `tests/unit.py` は Windows でも動きますが、`tests/probe.py` は PTY 前提なので WSL/Linux で
+- **注意**: Windows 実機での動作は未検証です（DSR 読み取りは Windows Terminal の応答を
+  前提にした実装）。まず `--print` で `prompt_row` が返るか確認してください
 
 ## 計算
 
@@ -176,7 +204,8 @@ info stock yazi (no flow): prompt_row=24 left_highlight_row=1 (= 22 rows of gaze
 - パッチ版バイナリが必要（`yazi-flow-yazi` が無いと警告して素の yazi で起動）。
 - Yazi を更新したら `scripts/build.sh --rebuild` で作り直し（`YAZI_TAG` で版を指定）。
 - タブを 2 枚以上にすると `Tabs.height()` が 1 行増え、決定行が 1 行ずれます。
-- `<Tab>`（spot）の吹き出し位置は Rust 側の stock 計算なので、パディング分ずれます。
-- 左ペインは決定行に固定なので、中央で深く移動すると左のハイライトと中央のカーソルは
-  上下に離れます（意図した挙動）。
+- `<Tab>`（spot）の吹き出し位置は Rust 側の stock 計算なので、差し替えた描画分ずれます。
+- 端末が DSR に応答しない場合（一部の端末・`--no-fallback` 指定時）はアンカーが付かず
+  素の yazi と同じ挙動になります。
 - 最下行のプロンプトだけはステータスバーの 1 行ぶん上まで（`R=24` → 23 行目）。
+- Windows 実機での動作は未検証（`yazi-flow --print` で確認してください）。
